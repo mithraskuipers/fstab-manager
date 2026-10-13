@@ -9,6 +9,11 @@
 #     swap, and anything already mounted at / , /boot, /boot/efi).
 #   - Lets you pick a device, pick (or create) a mount point under /mnt/,
 #     and appends a UUID-based fstab entry.
+#   - Unmounts the drive first if it is already mounted elsewhere
+#     (e.g. the desktop automounter under /media/<user>/<label>).
+#   - Refuses to use a mount point that already exists and is populated;
+#     an existing empty one is removed and recreated with the right owner.
+#   - Hands the mounted drive over to the invoking user (not root:root).
 #   - Entries always include `nofail` (+ a short device timeout, or
 #     automount) so the system will boot fine even if the drive is
 #     unplugged later.
@@ -25,6 +30,10 @@ FSTAB="/etc/fstab"
 MNT_BASE="/mnt"
 MARKER="# fstab-manager:"           # tag prepended to every entry we add
 BACKUP_DIR="/etc/fstab-manager-backups"
+
+# The human who ran sudo. Drives must end up owned by them, not root:root.
+OWNER_UID="${SUDO_UID:-1000}"
+OWNER_GID="${SUDO_GID:-1000}"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -87,10 +96,19 @@ validate_fstab() {
     fi
 }
 
+# Make systemd re-read /etc/fstab so it doesn't act on a stale copy.
+reload_systemd() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload 2>/dev/null
+    fi
+    return 0
+}
+
 # Roll back to a given backup file if something goes wrong.
 restore_backup() {
     local backup="$1"
     cp -a "$backup" "$FSTAB"
+    reload_systemd
     echo "Restored /etc/fstab from $backup"
 }
 
@@ -104,6 +122,122 @@ root_source() {
 disk_of() {
     local dev="$1"
     lsblk -no PKNAME "$dev" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Mount point + mount state handling
+# ---------------------------------------------------------------------------
+
+# Non-mutating check, used while the user is choosing a folder name.
+# Usage: check_mount_point <mount_point> <devpath> <uuid>
+# Returns 0 if usable, 1 (with a message) if not.
+check_mount_point() {
+    local mp="$1" devpath="$2" uuid="$3"
+
+    if mountpoint -q "$mp" 2>/dev/null; then
+        local src mnt_uuid
+        src="$(findmnt -n -o SOURCE "$mp" 2>/dev/null)"
+        mnt_uuid="$(findmnt -n -o UUID "$mp" 2>/dev/null)"
+        # Same drive already mounted here: fine, it gets unmounted and remounted.
+        if [[ "$src" == "$devpath" || ( -n "$mnt_uuid" && "$mnt_uuid" == "$uuid" ) ]]; then
+            return 0
+        fi
+        echo "ERROR: $mp is already a mount point of a different filesystem ($src)."
+        return 1
+    fi
+
+    if [[ -e "$mp" || -L "$mp" ]]; then
+        if [[ ! -d "$mp" || -L "$mp" ]]; then
+            echo "ERROR: $mp exists but is not a plain directory."
+            return 1
+        fi
+        if [[ -n "$(ls -A "$mp" 2>/dev/null)" ]]; then
+            echo "ERROR: $mp already exists and is NOT empty. Contents (first 10):"
+            ls -A "$mp" | head -n 10 | sed 's/^/    /'
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# Unmount the device from every place it is currently mounted, including
+# the desktop automounter's /media/<user>/<label> or /run/media/... location.
+# Returns 1 if it could not be fully unmounted.
+unmount_device_everywhere() {
+    local devpath="$1" uuid="$2"
+    local -a targets=()
+    local t
+
+    # Deepest paths first (reverse sort), duplicates removed.
+    mapfile -t targets < <(
+        {
+            findmnt -ln -o TARGET -S "$devpath" 2>/dev/null
+            findmnt -ln -o TARGET -S "UUID=$uuid" 2>/dev/null
+        } | sort -ur
+    )
+
+    for t in "${targets[@]}"; do
+        [[ -n "$t" ]] || continue
+        echo "Drive is currently mounted at $t, unmounting..."
+        if ! umount "$t"; then
+            echo "Could not unmount $t (busy?)."
+            if command -v fuser >/dev/null 2>&1; then
+                echo "Processes using it:"
+                fuser -vm "$t" 2>&1 | head -n 10
+            fi
+            if ask_yes_no "Try a lazy unmount (detaches now, finishes when no longer busy)?" 2; then
+                umount -l "$t" || return 1
+            else
+                return 1
+            fi
+        fi
+        # The desktop automounter can leave an empty directory behind.
+        case "$t" in
+            /media/*|/run/media/*) rmdir "$t" 2>/dev/null ;;
+        esac
+    done
+    return 0
+}
+
+# Make sure the mount point is a fresh, empty directory owned by the invoking
+# user. An existing empty directory is removed and recreated.
+# Assumes check_mount_point already passed and the device was unmounted.
+prepare_mount_point() {
+    local mp="$1"
+
+    if mountpoint -q "$mp" 2>/dev/null; then
+        echo "ERROR: $mp is still a mount point."
+        return 1
+    fi
+    if [[ -d "$mp" && ! -L "$mp" ]]; then
+        if [[ -n "$(ls -A "$mp" 2>/dev/null)" ]]; then
+            echo "ERROR: $mp is not empty, refusing to touch it."
+            return 1
+        fi
+        rmdir "$mp" || { echo "ERROR: could not remove $mp"; return 1; }
+    elif [[ -e "$mp" || -L "$mp" ]]; then
+        echo "ERROR: $mp exists but is not a plain directory."
+        return 1
+    fi
+
+    mkdir -p "$mp" || { echo "ERROR: could not create $mp"; return 1; }
+    chown "$OWNER_UID:$OWNER_GID" "$mp"
+    chmod 755 "$mp"
+    return 0
+}
+
+# Once mounted, ext4/xfs/btrfs expose the filesystem's own root directory,
+# which is root:root by default. Hand it to the invoking user (persists on the
+# drive). ntfs/vfat/exfat get their ownership from the uid=/gid= mount options.
+fix_ownership() {
+    local mp="$1" fstype="$2"
+    case "$fstype" in
+        ntfs|ntfs-3g|vfat|exfat) return 0 ;;
+    esac
+    if mountpoint -q "$mp" 2>/dev/null; then
+        chown "$OWNER_UID:$OWNER_GID" "$mp" && chmod 755 "$mp" \
+            && echo "Ownership of $mp set to uid=$OWNER_UID gid=$OWNER_GID."
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -199,6 +333,9 @@ add_drive() {
 
     echo
     echo "Selected: $devpath  ($size, $fstype, label='${label:-none}', UUID=$uuid)"
+    if [[ -n "$mnt" ]]; then
+        echo "NOTE: Currently mounted at $mnt, it will be unmounted and remounted at the new location."
+    fi
 
     # Check if this UUID is already in fstab
     if grep -q "UUID=$uuid" "$FSTAB" 2>/dev/null; then
@@ -212,20 +349,21 @@ add_drive() {
     suggested="$(echo "$suggested" | tr ' ' '_' | tr -cd '[:alnum:]_-')"
     [[ -z "$suggested" ]] && suggested="$name"
 
-    local mount_name
-    read -rp "Mount point folder name under $MNT_BASE/ [default: $suggested]: " mount_name
-    mount_name="${mount_name:-$suggested}"
-    mount_name="$(echo "$mount_name" | tr ' ' '_')"
-    local mount_point="$MNT_BASE/$mount_name"
+    # Ask for a folder name until it points at a usable location
+    local mount_name mount_point
+    while true; do
+        read -rp "Mount point folder name under $MNT_BASE/ [default: $suggested, 'q' to cancel]: " mount_name
+        [[ "$mount_name" == "q" ]] && { echo "Cancelled."; pause; return; }
+        mount_name="${mount_name:-$suggested}"
+        mount_name="$(echo "$mount_name" | tr ' ' '_')"
+        mount_point="$MNT_BASE/$mount_name"
+        check_mount_point "$mount_point" "$devpath" "$uuid" && break
+        echo "Choose a different folder name."
+        echo
+    done
 
     echo
     echo "Mount point will be: $mount_point"
-    if [[ -d "$mount_point" ]]; then
-        if [[ -n "$(ls -A "$mount_point" 2>/dev/null)" ]] && ! mountpoint -q "$mount_point"; then
-            echo "WARNING: $mount_point already exists and is NOT empty (and not currently a mountpoint)."
-            ask_yes_no "Continue anyway?" 2 || { echo "Cancelled."; pause; return; }
-        fi
-    fi
 
     # How should the boot behave if this drive is missing?
     echo
@@ -240,11 +378,11 @@ add_drive() {
     local opts=""
     case "$fstype" in
         ntfs|ntfs-3g)
-            opts="uid=1000,gid=1000,umask=022,windows_names"
+            opts="uid=$OWNER_UID,gid=$OWNER_GID,umask=022,windows_names"
             fstype="ntfs-3g"
             ;;
         vfat|exfat)
-            opts="uid=1000,gid=1000,umask=022"
+            opts="uid=$OWNER_UID,gid=$OWNER_GID,umask=022"
             ;;
         ext2|ext3|ext4|xfs|btrfs)
             opts="defaults"
@@ -266,14 +404,27 @@ add_drive() {
     local fstab_line="UUID=$uuid  $mount_point  $fstype  $opts  $dump  $passno"
 
     echo
-    echo "About to create the mount point (if needed) and add this line to $FSTAB:"
+    echo "About to unmount the drive if mounted elsewhere, (re)create the mount point"
+    echo "owned by uid=$OWNER_UID gid=$OWNER_GID, and add this line to $FSTAB:"
     echo
     echo "  $MARKER $label ($devpath)"
     echo "  $fstab_line"
     echo
     ask_yes_no "Proceed?" 1 || { echo "Cancelled."; pause; return; }
 
-    mkdir -p "$mount_point" || die "Could not create $mount_point"
+    # Free the device from any existing mount (e.g. /media/<user>/<label>)
+    if ! unmount_device_everywhere "$devpath" "$uuid"; then
+        echo "Could not unmount the drive. Nothing was changed."
+        pause
+        return
+    fi
+
+    # Fresh empty mount point with the right owner
+    if ! prepare_mount_point "$mount_point"; then
+        echo "Nothing was changed in $FSTAB."
+        pause
+        return
+    fi
 
     local backup
     backup="$(backup_fstab)"
@@ -291,9 +442,12 @@ add_drive() {
         return
     fi
 
+    reload_systemd
+
     echo "Validation OK. Mounting now to confirm it actually works..."
     if mount "$mount_point" 2>/tmp/fstab-manager-mount-err; then
         echo "Mounted successfully at $mount_point."
+        fix_ownership "$mount_point" "$fstype"
     else
         echo "Mount FAILED:"
         cat /tmp/fstab-manager-mount-err
@@ -396,6 +550,7 @@ remove_drive() {
         pause
         return
     fi
+    reload_systemd
     echo "Removed from $FSTAB."
 
     if [[ -d "$mp" ]] && [[ -z "$(ls -A "$mp" 2>/dev/null)" ]]; then
